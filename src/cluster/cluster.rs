@@ -11,7 +11,7 @@ use kvproto::{
 };
 use parking_lot::Mutex;
 use protobuf::Message;
-use slog::{error, info, Logger};
+use slog::{debug, error, info, Logger};
 use std::{
     collections::HashMap,
     convert::TryInto,
@@ -50,6 +50,7 @@ async fn bootstrap(cluster: Cluster) {
             notifier: tx.clone(),
         };
         cluster.sender.send(msg).unwrap();
+        debug!(cluster.logger, "in bootstrap, send CommittedToCurrentTerm");
         let (leader, term, my_id) = match rx.next().await {
             Some(Res::RoleInfo {
                 leader,
@@ -58,6 +59,10 @@ async fn bootstrap(cluster: Cluster) {
             }) => (leader, term, my_id),
             _ => return,
         };
+        debug!(
+            cluster.logger,
+            "in bootstrap, get leader:{}, term:{}, my_id:{}", leader, term, my_id
+        );
         let msg = Msg::snapshot(tx.clone());
         cluster.sender.send(msg).unwrap();
         match rx.next().await {
@@ -74,7 +79,7 @@ async fn bootstrap(cluster: Cluster) {
                     };
                     info!(
                         cluster.logger,
-                        "recover cluster id {}, bootstrap: {}", id, bootstrapped
+                        "in bootstrap recover cluster id {}, bootstrap: {}", id, bootstrapped
                     );
                     cluster.meta.id.store(id, Ordering::SeqCst);
                     return;
@@ -85,7 +90,7 @@ async fn bootstrap(cluster: Cluster) {
                 }
             },
             Some(Res::Fail(e)) => {
-                error!(cluster.logger, "failed to fetch cluster id: {}", e);
+                debug!(cluster.logger, "failed to fetch cluster id: {}", e);
                 Delay::new(Duration::from_secs(1)).await;
                 continue;
             }
@@ -105,7 +110,7 @@ async fn bootstrap(cluster: Cluster) {
             .unwrap();
         match rx.next().await {
             Some(Res::Success) => {
-                info!(cluster.logger, "init cluster with id {}", id);
+                info!(cluster.logger, "in bootstrap init cluster with id {}", id);
                 cluster.meta.id.store(id, Ordering::Relaxed);
                 return;
             }
@@ -130,6 +135,7 @@ async fn reload_cluser_meta(cluster: Cluster) {
             event: Event::CommittedToCurrentTermAsLeader,
             notifier: tx.clone(),
         };
+        // info!(cluster.logger, "reload cluster meta send msg:{:?}", msg);
         cluster.sender.send(msg).unwrap();
         let term = match rx.next().await {
             Some(Res::RoleInfo { term, .. }) => term,
@@ -187,7 +193,7 @@ impl BootstrapGuard {
     ) -> Result<()> {
         info!(
             self.cluster.logger,
-            "{:?} tries to bootstrap with region: {:?}", store, region
+            "in bootstrap {:?} tries to bootstrap with region: {:?}", store, region
         );
         let (tx, mut rx) = mpsc::channel(1);
         let mut buffer = store.write_length_delimited_to_bytes()?;
@@ -200,13 +206,45 @@ impl BootstrapGuard {
             ),
         ];
         let command = Command::batch_put(kvs);
-        let msg = Msg::command(command, Some(tx));
+        let msg = Msg::command(command, Some(tx.clone()));
         self.cluster.sender.send(msg).unwrap();
-        match rx.next().await {
+        let ret = match rx.next().await {
             Some(Res::Success) => {
+                debug!(
+                    self.cluster.logger,
+                    "in bootstrap, set bootstrap key success"
+                );
                 self.reset_on_drop = false;
                 Ok(())
             }
+            Some(Res::Fail(e)) => Err(Error::Other(e)),
+            None => Err(Error::Other("instance shutting down".to_string())),
+            res => panic!("unexpected result: {:?}", res),
+        };
+        if ret.is_err() {
+            return ret;
+        }
+
+        let msg_snapshot = Msg::snapshot(tx.clone());
+        self.cluster.sender.send(msg_snapshot).unwrap();
+        match rx.next().await {
+            Some(Res::Snapshot(snap)) => match snap.get(&*CLUSTER_BOOTSTRAP_KEY) {
+                Ok(Some(_)) => {
+                    self.cluster
+                        .meta
+                        .bootstrap
+                        .store(BOOTSTRAPPED, Ordering::SeqCst);
+                    info!(
+                        self.cluster.logger,
+                        "in bootstrap recover cluster id {}, bootstrap: {}",
+                        self.cluster.id(),
+                        self.cluster.is_bootstrapped()
+                    );
+                    Ok(())
+                }
+                Ok(None) => Err(Error::Other("set cluster bootstrap key fail".to_string())),
+                Err(e) => Err(Error::Other("instance shutting down".to_string())),
+            },
             Some(Res::Fail(e)) => Err(Error::Other(e)),
             None => Err(Error::Other("instance shutting down".to_string())),
             res => panic!("unexpected result: {:?}", res),
@@ -293,6 +331,7 @@ impl Cluster {
     }
 
     pub async fn get_members(&self) -> Result<(Member, Vec<Member>)> {
+        debug!(self.logger, "cluster get_members");
         let (tx, mut rx) = mpsc::channel(1);
         let msg = Msg::WaitEvent {
             event: Event::CommittedToCurrentTerm,
@@ -324,10 +363,15 @@ impl Cluster {
                 new_member(id, addr)
             })
             .collect();
+        debug!(
+            self.logger,
+            "cluster get members,leader:{:?}, members:{:?}", leader, members
+        );
         Ok((leader, members))
     }
 
     pub async fn put_store(&self, store: metapb::Store) -> Result<()> {
+        debug!(self.logger, "cluster put_store:{:#?}", store);
         let (tx, mut rx) = mpsc::channel(1);
         // TODO: check address, state.
         let key = Bytes::copy_from_slice(&store_key(store.get_id()));
@@ -339,6 +383,7 @@ impl Cluster {
         if !matches!(res, Some(Res::Success)) {
             return Err(Error::Other(format!("failed to put store: {:?}", res)));
         }
+        debug!(self.logger, "cluster put_store response ok");
         Ok(())
     }
 
@@ -363,6 +408,8 @@ impl Cluster {
     ) {
         let meta = self.meta.clone();
         let sender = self.sender.clone();
+        let logger = self.logger.clone();
+        debug!(self.logger, "register_region_stream, store_id:{}", store_id);
         let loop_update_region = async move {
             let mut batch = Vec::with_capacity(100);
             let mut updates = vec![];
@@ -388,6 +435,12 @@ impl Cluster {
                 let mut listeners = hub.get_mut(&region_id);
                 let region = heartbeat.take_region();
                 let cached_region = region_cached.get(&region_id);
+                debug!(
+                    logger,
+                    "register_region_stream, heartbeat_region:{:#?}, cached_region:{:#?}",
+                    region,
+                    cached_region
+                );
                 if cached_region.map_or(true, |r| stale_region(r, &region)) {
                     updates.push((
                         Bytes::copy_from_slice(&region_key(region.get_id())),
@@ -403,13 +456,35 @@ impl Cluster {
                     if let Some(r) = &cached_region {
                         let origin_ver = r.get_region_epoch().get_version();
                         let cur_ver = region.get_region_epoch().get_version();
+                        debug!(
+                            logger,
+                            "register_region_stream, cur_ver:{:#?}, origin_ver:{:#?}",
+                            cur_ver,
+                            origin_ver
+                        );
                         if origin_ver != cur_ver {
                             let origin_key = region_range_key(r.get_end_key(), origin_ver);
+                            debug!(
+                                logger,
+                                "register_region_stream, origin_key:{:#?}", origin_key
+                            );
                             updates.push((origin_key, Bytes::new()));
                             let cur_key = region_range_key(region.get_end_key(), cur_ver);
+                            debug!(logger, "register_region_stream, cur_key:{:#?}", cur_key);
                             let val = region_range_value(region_id);
+                            debug!(
+                                logger,
+                                "register_region_stream, cur_key:{:#?}, region_id:{}",
+                                cur_key,
+                                region_id
+                            );
                             updates.push((cur_key, val));
                         }
+                    } else {
+                        let cur_ver = region.get_region_epoch().get_version();
+                        let cur_key = region_range_key(region.get_end_key(), cur_ver);
+                        let val = region_range_value(region_id);
+                        updates.push((cur_key, val));
                     }
                     region_cached.insert(region.get_id(), region);
                 }
@@ -421,6 +496,7 @@ impl Cluster {
             // This is not technically correct as it doesn't check if caches match physical
             // storage. But it will eventually correct as heartbeat will keep being reported.
             if !updates.is_empty() {
+                debug!(logger, "register_region_stream, updates:{:#?}", updates);
                 let cmd = Command::batch_put(updates);
                 let _ = sender.try_send(Msg::command(cmd, None));
             }
@@ -438,6 +514,10 @@ impl Cluster {
             let mut hub = meta.region_event_hub.lock();
             let mut listeners = hub.get_mut(&region_id);
             let cached_region = cached.get(&region_id);
+            debug!(
+                self.logger,
+                "put_regions, region:{:#?}, cached_region:{:#?}", region, cached_region
+            );
             if cached_region.map_or(true, |r| stale_region(r, &region)) {
                 updates.push((
                     Bytes::copy_from_slice(&region_key(region.get_id())),
@@ -460,14 +540,87 @@ impl Cluster {
                         let val = region_range_value(region_id);
                         updates.push((cur_key, val));
                     }
+                } else {
+                    debug!(self.logger, "update_regions, cached_region is none");
+                    let cur_ver = region.get_region_epoch().get_version();
+                    let cur_key = region_range_key(region.get_end_key(), cur_ver);
+                    let val = region_range_value(region_id);
+                    updates.push((cur_key, val));
                 }
                 cached.insert(region.get_id(), region);
             }
         }
         if !updates.is_empty() {
+            debug!(self.logger, "update_regions, updates:{:#?}", updates);
             let cmd = Command::batch_put(updates);
             let _ = self.sender.try_send(Msg::command(cmd, None));
         }
+    }
+
+    pub async fn update_gc_safe_point(&self, safe_point: u64) -> Result<()> {
+        debug!(
+            self.logger,
+            "cluster update_gc_safe_point:{:#?}", safe_point
+        );
+        let (tx, mut rx) = mpsc::channel(1);
+        // TODO: check address, state.
+        let key = Bytes::copy_from_slice(GC_SAFEPOINT_KEY_PREFIX);
+        let mut buf = BytesMut::with_capacity(8);
+        buf.put_u64_le(safe_point);
+        let put = Command::put(key, buf.freeze());
+        let msg = Msg::command(put, Some(tx.clone()));
+        self.sender.send(msg).unwrap();
+        let res = rx.next().await;
+        if !matches!(res, Some(Res::Success)) {
+            return Err(Error::Other(format!(
+                "failed to update_gc_safe_point: {:?}",
+                res
+            )));
+        }
+        debug!(self.logger, "cluster update_gc_safe_point ok");
+        Ok(())
+    }
+
+    pub async fn update_service_gc_safe_point(
+        &self,
+        service_id: &[u8],
+        ttl: i64,
+        safe_point: u64,
+    ) -> Result<()> {
+        debug!(
+            self.logger,
+            "cluster update_service_gc_safe_point, service_id:{:#?}, ttl:{:?}:{:#?}",
+            service_id,
+            ttl,
+            safe_point
+        );
+        if service_id.is_empty() {
+            return Err(Error::Other(
+                "service id of service safepoint cannot be empty".to_string(),
+            ));
+        }
+        if service_id == GCWORKER_SERVICE_SAFEPOINT_ID && ttl != i64::MAX {
+            return Err(Error::Other(
+                "sTTL of gc_worker's service safe point must be infinity".to_string(),
+            ));
+        }
+        let (tx, mut rx) = mpsc::channel(1);
+        let key = service_safe_point_key(service_id);
+        let mut buf = BytesMut::with_capacity(16);
+        buf.put_i64_le(ttl);
+        buf.put_u64_le(safe_point);
+        let put = Command::put(key, buf.freeze());
+        let msg = Msg::command(put, Some(tx.clone()));
+        self.sender.send(msg).unwrap();
+        let res = rx.next().await;
+        if !matches!(res, Some(Res::Success)) {
+            return Err(Error::Other(format!(
+                "failed to update_service_gc_safe_point: {:?}",
+                res
+            )));
+        }
+        debug!(self.logger, "cluster update_service_gc_safe_point ok");
+        Ok(())
     }
 }
 

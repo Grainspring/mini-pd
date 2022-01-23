@@ -82,6 +82,29 @@ impl Command {
     }
 }
 
+impl Debug for Command {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Command::Put { key, value } => write!(
+                formatter,
+                "Command::Put {{key:{:?}, value:{:?}}}",
+                key, value
+            ),
+            Command::UpdateAddress { id, address } => write!(
+                formatter,
+                "Command::UpdateAddress {{id:{:?}, addr:{:?}}}",
+                id, address
+            ),
+            Command::BatchPut { kvs } => write!(
+                formatter,
+                "Command::BatchPut {{kvs.len:{:?}, kvs:{:#?}}}",
+                kvs.len(),
+                kvs
+            ),
+        }
+    }
+}
+
 pub enum Res {
     Success,
     Snapshot(RockSnapshot),
@@ -116,6 +139,19 @@ pub enum Event {
     BecameLeader,
     CommittedToCurrentTerm,
     CommittedToCurrentTermAsLeader,
+}
+
+impl Debug for Event {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Event::Elected => write!(formatter, "Event::Elected"),
+            Event::BecameLeader => write!(formatter, "Event::BecameLeader"),
+            Event::CommittedToCurrentTerm => write!(formatter, "Event::CommittedToCurrentTerm"),
+            Event::CommittedToCurrentTermAsLeader => {
+                write!(formatter, "Event::CommittedToCurrentTermAsLeader")
+            }
+        }
+    }
 }
 
 pub enum Msg {
@@ -169,6 +205,33 @@ impl Msg {
     }
 }
 
+impl Debug for Msg {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Msg::Command {
+                cmd,
+                term,
+                notifier,
+            } => write!(
+                formatter,
+                "Msg::Command {{cmd:{:?}, term::{:?}}}",
+                cmd, term
+            ),
+
+            Msg::Snapshot { term, notifier } => {
+                write!(formatter, "Msg::Snapshot {{term:{:?}}}", term)
+            }
+
+            Msg::WaitEvent { event, notifier } => {
+                write!(formatter, "Msg::WaitEvent {{ event: {:?} }}", event)
+            }
+            Msg::RaftMessage(Message) => write!(formatter, "Msg::RaftMessage({:?})", Message),
+            Msg::Tick => write!(formatter, "Msg::Tick"),
+            Msg::Stop => write!(formatter, "Msg::Stop"),
+        }
+    }
+}
+
 fn batch_put_proposal(kvs: &[(Bytes, Bytes)]) -> Vec<u8> {
     let mut res = Vec::new();
     let mut s = CodedOutputStream::new(&mut res);
@@ -176,6 +239,7 @@ fn batch_put_proposal(kvs: &[(Bytes, Bytes)]) -> Vec<u8> {
         s.write_bytes_no_tag(k).unwrap();
         s.write_bytes_no_tag(v).unwrap();
     }
+    s.flush();
     res.push(Command::BATCH_PUT_KEY);
     res
 }

@@ -7,7 +7,7 @@ use crossbeam::channel::Sender;
 use grpcio::{EnvBuilder, Environment};
 use kvproto::{minipdpb, pdpb};
 use rocksdb::DB;
-use slog::Logger;
+use slog::{info, Logger};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use yatp::task::future::TaskCell;
@@ -95,6 +95,10 @@ impl Server {
         if let Some(p) = self.config.address.find(':') {
             let host = self.config.address[..p].to_owned();
             if let Ok(port) = self.config.address[p + 1..].parse() {
+                info!(
+                    self.logger,
+                    "get_bind_pair,host:{:#?},port:{:#?}", host, port
+                );
                 return Ok((host, port));
             }
         }

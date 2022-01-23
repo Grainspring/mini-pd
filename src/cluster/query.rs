@@ -4,17 +4,17 @@ use kvproto::metapb;
 use protobuf::Message;
 use rocksdb::{DBIterator, ReadOptions, SeekKey, DB};
 
-use super::codec::{region_key, region_range_key, store_key};
-use crate::kv::RockSnapshot;
+use super::codec::{region_key, region_range_key, store_key, GC_SAFEPOINT_KEY_PREFIX};
+use crate::{kv::RockSnapshot, Error, Result};
 
 pub fn get_region_by_key(snap: &RockSnapshot, key: &[u8], prev: bool) -> Option<metapb::Region> {
     let mut iter = snap.iter();
     let b = if !prev {
         let start_key = region_range_key(key, 0);
-        iter.seek(SeekKey::Key(&start_key)).unwrap()
+        iter.seek_for_prev(SeekKey::Key(&start_key)).unwrap()
     } else {
         let start_key = region_range_key(key, u64::MAX);
-        iter.seek_for_prev(SeekKey::Key(&start_key)).unwrap()
+        iter.seek(SeekKey::Key(&start_key)).unwrap()
     };
     if !b {
         return None;
@@ -103,4 +103,16 @@ pub fn get_cluster_version(snap: &RockSnapshot) -> Option<String> {
         }
     }
     None
+}
+
+pub fn get_gc_safe_point(snap: &RockSnapshot) -> Result<u64> {
+    let val = match snap.get(GC_SAFEPOINT_KEY_PREFIX) {
+        Ok(Some(v)) => v,
+        Ok(None) => return Ok(0),
+        Err(e) => return Err(Error::Other("instance shutting down".to_string())),
+    };
+    // TODO: use more clean method
+    let data: &[u8] = &val;
+    let safe_point = u64::from_be_bytes(data.try_into().unwrap());
+    Ok(safe_point)
 }

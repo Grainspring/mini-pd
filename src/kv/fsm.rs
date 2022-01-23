@@ -7,7 +7,7 @@ use futures_timer::Delay;
 use raft::eraftpb::{Entry, Message};
 use raft::{prelude::*, INVALID_ID};
 use rocksdb::{ReadOptions, SeekKey, Writable, WriteBatch, DB};
-use slog::{info, o, Logger};
+use slog::{debug, info, o, Logger};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::convert::TryInto;
 use std::sync::Arc;
@@ -207,12 +207,14 @@ impl Fsm {
     }
 
     fn process(&mut self, start: Instant, msg: Msg) {
+        // debug!(self.logger, "process msg:{:?}", msg);
         match msg {
             Msg::Command {
                 cmd,
                 term,
                 notifier,
             } => {
+                // debug!(self.logger, "process msg command:{:?}, term:{:?}", cmd, term);
                 if term.map_or(false, |t| t != self.node.raft.term) {
                     if let Some(mut notifier) = notifier {
                         let msg = format!(
@@ -232,6 +234,8 @@ impl Fsm {
                     return;
                 }
                 let (context, data) = cmd.into_proposal();
+                // debug!(self.logger, "process msg after into_proposal, context:{:?},data:{:?}"
+                //    , context, data);
                 let last_last_index = self.node.raft.raft_log.last_index();
                 let e = self.node.propose(context, data).err();
                 let last_index = self.node.raft.raft_log.last_index();
@@ -253,6 +257,7 @@ impl Fsm {
                 }
             }
             Msg::Snapshot { term, mut notifier } => {
+                // debug!(self.logger, "process msg:snapshot:{:?}", term);
                 // This is not technically safe, should use uuid.
                 let my_term = self.node.raft.term;
                 if term.map_or(false, |t| t != my_term) {
@@ -274,15 +279,27 @@ impl Fsm {
                 if leader_id != INVALID_ID {
                     if event == Event::Elected
                         || event == Event::BecameLeader && leader_id == self.id()
-                        || event == Event::CommittedToCurrentTerm
-                            && self.node.raft.commit_to_current_term()
+                    {
+                        let _ = notifier.try_send(self.role_info());
+                    } else if event == Event::CommittedToCurrentTerm
+                        && self.node.raft.commit_to_current_term()
                         || event == Event::CommittedToCurrentTermAsLeader
                             && leader_id == self.id()
                             && self.node.raft.commit_to_current_term()
                     {
+                        // debug!(self.logger, "process msg:waitevent, notify receiver,{:?}"
+                        //    , self.role_info());
                         let _ = notifier.try_send(self.role_info());
+                    } else {
+                        // debug!(self.logger, "process msg:waitevent, push back in wait_event, leader_id:{}", leader_id);
+                        self.notifiers
+                            .wait_event
+                            .entry(event)
+                            .or_default()
+                            .push(notifier);
                     }
                 } else {
+                    // debug!(self.logger, "process msg:waitevent, push back to wait_event");
                     self.notifiers
                         .wait_event
                         .entry(event)
@@ -291,6 +308,7 @@ impl Fsm {
                 }
             }
             Msg::RaftMessage(msg) => {
+                debug!(self.logger, "process msg:raftmsg");
                 if let Err(e) = self.node.step(msg) {
                     info!(self.logger, "failed to step message {}", e);
                 } else {
@@ -312,9 +330,15 @@ impl Fsm {
             let data = entry.take_data();
             let index = entry.get_index();
             let term = entry.get_term();
+            // debug!(self.logger, "handle_committed_entries,context:{:#?},data:{:#?},index:{:#?}",
+            //            context, data, index);
             let res = match Command::from_proposal(context, data) {
                 None => Res::Success,
                 Some(Command::Put { key, value }) => {
+                    debug!(
+                        self.logger,
+                        "handle_committed_entries, command put,key:{:#?},value:{:#?}", key, value
+                    );
                     if valid_data_key(&key) {
                         let res = if !value.is_empty() {
                             self.write_batch.put(&*key, &*value)
@@ -330,6 +354,8 @@ impl Fsm {
                     }
                 }
                 Some(Command::UpdateAddress { id, address }) => {
+                    // debug!(self.logger, "handle_committed_entries, command UpdateAddress,id:{:#?},address:{:#?}",
+                    //    id, address);
                     if let Err(e) = self.write_batch.put(&address_key(id), address.as_bytes()) {
                         panic!("unable to write address at {}: {}", index, e);
                     }
@@ -337,9 +363,12 @@ impl Fsm {
                     Res::Success
                 }
                 Some(Command::BatchPut { kvs }) => {
-                    match kvs.iter().find(|(key, _)| valid_data_key(&key)) {
+                    // debug!(self.logger, "handle_committed_entries, command batchput,kvs.len:{:?},kvs:{:#?}", kvs.len(), kvs);
+                    match kvs.iter().find(|(key, _)| !valid_data_key(&key)) {
                         None => {
                             for (key, value) in kvs {
+                                // debug!(self.logger, "handle_committed_entries, command batchput,key:{:#?}, value:{:#?}",
+                                // key, value);
                                 if let Err(e) = self.write_batch.put(&*key, &*value) {
                                     panic!("unable to apply command: {:?}", e);
                                 }
@@ -367,10 +396,12 @@ impl Fsm {
         for read in read_states {
             let id = u64::from_ne_bytes(read.request_ctx.try_into().unwrap());
             if let Some(mut req) = self.notifiers.read_states.remove(&id) {
+                // debug!(self.logger, "process_read, index:{}", read.index);
                 if read.index <= self.node.store().applied() {
                     let _ = req
                         .notifier
                         .try_send(Res::Snapshot(self.node.store().rock_snapshot()));
+                    // debug!(self.logger, "after send snapshot");
                 }
                 self.notifiers
                     .read_queue
@@ -396,6 +427,7 @@ impl Fsm {
     }
 
     fn notify_role_changed(&mut self) {
+        // debug!(self.logger, "notify_role_changed");
         let leader_id = self.node.raft.leader_id;
         if self.notifiers.wait_event.is_empty() || leader_id == INVALID_ID {
             return;
@@ -449,10 +481,12 @@ impl Fsm {
             let mut ready = self.node.ready();
             self.notify_role_changed();
             let applied_index = if !ready.committed_entries().is_empty() {
+                // debug!(self.logger, "in prcess_ready, begin handle committed entries");
                 Some(self.handle_committed_entries(ready.take_committed_entries()))
             } else {
                 None
             };
+            // debug!(self.logger, "in prcess_ready, after handle committed entries");
             if !ready.messages().is_empty() {
                 self.send_messages(ready.take_messages());
             }
@@ -472,6 +506,7 @@ impl Fsm {
                 sync_log |= ready.must_sync();
                 self.unsynced_data_size += self.write_batch.data_size() as u64;
                 r!(self.db.write(&self.write_batch));
+                // debug!(self.logger, "in prcess_ready, after db write batch, sync_log:{:?}", sync_log);
             }
             self.node.mut_store().post_ready(context);
             if !ready.persisted_messages().is_empty() {
@@ -489,6 +524,7 @@ impl Fsm {
             // Don't need to wait syncing here. If the node is crash and restarted,
             // ReadIndex will make sure all pending entries must be seen.
             self.notify_applied();
+            // debug!(self.logger, "in prcess_ready, end of process_ready");
         }
         self.has_ready = false;
         if self.unsynced_data_size >= 512 * 1024
@@ -539,6 +575,7 @@ impl Fsm {
     pub fn poll(&mut self) -> Result<()> {
         let mut timeout = None;
         loop {
+            // debug!(self.logger, "\n\n\nstart poll loop, timeout:{:?}", timeout);
             let mut msg = if let Some(dur) = timeout {
                 match self.receiver.recv_timeout(dur) {
                     Ok(msg) => Some(msg),
@@ -566,7 +603,9 @@ impl Fsm {
                 msg = self.receiver.try_recv().ok();
             }
             self.process_ready(start)?;
+            // debug!(self.logger, "\n\nin poll, after process_ready");
             timeout = self.suggest_timeout();
+            // debug!(self.logger, "in poll, get suggest_timeout:{:?}", timeout);
         }
     }
 }

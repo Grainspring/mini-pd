@@ -31,6 +31,7 @@ impl IdWatcher {
             event: Event::CommittedToCurrentTermAsLeader,
             notifier: self.tx.clone(),
         };
+        info!(self.allocator.logger, "id watcher send msg:{:?}", msg);
         self.allocator.sender.send(msg).unwrap();
         let term = match self.rx.next().await {
             Some(Res::RoleInfo { term, .. }) => term,

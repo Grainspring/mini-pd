@@ -9,7 +9,7 @@ use grpcio::{RequestStream, RpcContext, UnarySink};
 use kvproto::metapb;
 use kvproto::pdpb::{self, *};
 use rocksdb::DB;
-use slog::{error, Logger};
+use slog::{debug, error, info, Logger};
 use std::cmp;
 use std::sync::Arc;
 use yatp::task::future::TaskCell;
@@ -150,6 +150,7 @@ impl PdService {
                 String::new(),
             );
         }
+        debug!(self.logger, "get_region_by_id_impl, resp:{:#?}", resp);
         ctx.spawn(async move {
             let _ = sink.success(resp);
         });
@@ -165,6 +166,10 @@ impl PdService {
         let resp = check_bootstrap!(ctx, self.cluster, sink, req, GetRegionResponse);
         let snap = self.db.build();
         let region = query::get_region_by_key(&snap, req.get_region_key(), reverse);
+        debug!(
+            self.logger,
+            "get_region_impl, reverse:{}, region:{:#?}", reverse, region
+        );
         self.get_region_by_id_impl(ctx, region, resp, sink);
     }
 
@@ -185,8 +190,10 @@ impl Pd for PdService {
         req: GetMembersRequest,
         sink: UnarySink<GetMembersResponse>,
     ) {
+        debug!(self.logger, "pd get_members from client:{}", ctx.peer());
         let mut resp = check_cluster!(ctx, self.cluster, sink, req, GetMembersResponse);
         let cluster = self.cluster.clone();
+        let logger = self.logger.clone();
         let f = async move {
             match cluster.get_members().await {
                 Ok((leader, peers)) => {
@@ -198,6 +205,7 @@ impl Pd for PdService {
                     fill_error(resp.mut_header(), ErrorType::UNKNOWN, format!("{}", e));
                 }
             }
+            debug!(logger, "pd get_members reps:{:#?}", resp);
             let _ = sink.success(resp).await;
         };
         ctx.spawn(f);
@@ -209,6 +217,7 @@ impl Pd for PdService {
         stream: RequestStream<TsoRequest>,
         mut sink: DuplexSink<TsoResponse>,
     ) {
+        debug!(self.logger, "pd tso from client:{}", ctx.peer());
         let allocator = self.allocator.tso().clone();
         let logger = self.logger.clone();
         let meta = self.cluster.meta().clone();
@@ -266,6 +275,7 @@ impl Pd for PdService {
                     sink.send((resp, WriteFlags::default().buffer_hint(!buf.is_empty())))
                         .await?;
                     for (i, c) in buf.iter().enumerate() {
+                        debug!(logger, "pd tso response, {:?}=>{:?}", i, c);
                         let resp = new_tso_response(cluster_id, *c, &mut start);
                         sink.send((resp, WriteFlags::default().buffer_hint(i + 1 != buf.len())))
                             .await?;
@@ -286,6 +296,7 @@ impl Pd for PdService {
         req: BootstrapRequest,
         sink: UnarySink<BootstrapResponse>,
     ) {
+        debug!(self.logger, "pd bootstrap from:{}, {:#?}", ctx.peer(), req);
         let mut resp = check_cluster!(ctx, self.cluster, sink, req, BootstrapResponse);
         let mut guard = match self.cluster.lock_for_bootstrap() {
             Ok(guard) => guard,
@@ -322,8 +333,15 @@ impl Pd for PdService {
         req: IsBootstrappedRequest,
         sink: UnarySink<IsBootstrappedResponse>,
     ) {
+        debug!(
+            self.logger,
+            "pd is_bootstrap from:{}, {:#?}",
+            ctx.peer(),
+            req
+        );
         let mut resp = check_cluster!(ctx, self.cluster, sink, req, IsBootstrappedResponse);
         let bootstrapped = self.cluster.is_bootstrapped();
+        debug!(self.logger, "pd is_bootstrap response:{}", bootstrapped);
         resp.set_bootstrapped(bootstrapped);
         ctx.spawn(async move {
             let _ = sink.success(resp).await;
@@ -331,11 +349,16 @@ impl Pd for PdService {
     }
 
     fn alloc_id(&mut self, ctx: RpcContext, req: AllocIDRequest, sink: UnarySink<AllocIDResponse>) {
+        debug!(self.logger, "pd alloc_id from:{}, {:#?}", ctx.peer(), req);
         let mut resp = check_cluster!(ctx, self.cluster, sink, req, AllocIDResponse);
         let id = self.allocator.id().clone();
+        let logger = self.logger.clone();
         let f = async move {
             match id.alloc(1).await {
-                Ok(id) => resp.set_id(id),
+                Ok(id) => {
+                    debug!(logger, "pd alloc_id:{:?}", id);
+                    resp.set_id(id);
+                }
                 Err(e) => {
                     fill_error(resp.mut_header(), ErrorType::UNKNOWN, format!("{}", e));
                 }
@@ -351,6 +374,7 @@ impl Pd for PdService {
         req: GetStoreRequest,
         sink: UnarySink<GetStoreResponse>,
     ) {
+        debug!(self.logger, "pd get_store from:{}", ctx.peer());
         let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, GetStoreResponse);
         let store_id = req.get_store_id();
         let store = query::load_store(&self.db.build(), store_id);
@@ -363,6 +387,7 @@ impl Pd for PdService {
                 "store not found".to_string(),
             );
         }
+        debug!(self.logger, "pd get_store reps:{:#?}", resp);
         ctx.spawn(async move {
             let _ = sink.success(resp);
         });
@@ -374,11 +399,14 @@ impl Pd for PdService {
         mut req: PutStoreRequest,
         sink: UnarySink<PutStoreResponse>,
     ) {
+        debug!(self.logger, "pd put_store from:{}, {:#?}", ctx.peer(), req);
         let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, PutStoreResponse);
         let cluster = self.cluster.clone();
         let store = req.take_store();
+        let logger = self.logger.clone();
         let f = async move {
             if let Err(e) = cluster.put_store(store).await {
+                debug!(logger, "cluster put_store fail");
                 fill_error(resp.mut_header(), ErrorType::UNKNOWN, format!("{}", e));
             }
             let _ = sink.success(resp).await;
@@ -392,6 +420,7 @@ impl Pd for PdService {
         req: GetAllStoresRequest,
         sink: UnarySink<GetAllStoresResponse>,
     ) {
+        debug!(self.logger, "pd get_all_stores from:{}", ctx.peer());
         let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, GetAllStoresResponse);
         let stores = query::load_all_stores(&RockSnapshot::new(self.db.clone()));
         if !stores.is_empty() {
@@ -403,6 +432,7 @@ impl Pd for PdService {
                 "no store found".to_string(),
             );
         }
+        debug!(self.logger, "pd get_all_stores reps:{:#?}", resp);
         ctx.spawn(async move {
             let _ = sink.success(resp);
         });
@@ -414,6 +444,12 @@ impl Pd for PdService {
         mut req: StoreHeartbeatRequest,
         sink: UnarySink<StoreHeartbeatResponse>,
     ) {
+        debug!(
+            self.logger,
+            "pd store_hearbeat from:{}, req:{:#?}",
+            ctx.peer(),
+            req
+        );
         let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, StoreHeartbeatResponse);
         self.cluster.update_store_stats(req.take_stats());
         // TODO: support cluster version.
@@ -431,15 +467,19 @@ impl Pd for PdService {
         mut stream: RequestStream<RegionHeartbeatRequest>,
         mut sink: DuplexSink<RegionHeartbeatResponse>,
     ) {
+        debug!(self.logger, "pd region_hearbeat from:{}", ctx.peer());
         // TODO: check cluster id.
         let logger = self.logger.clone();
         let cluster = self.cluster.clone();
         let remote = self.remote.clone();
         let f = async move {
             let req = match stream.try_next().await {
-                Ok(Some(req)) => req,
+                Ok(Some(req)) => {
+                    debug!(logger, "pd region_hearbeat, request:{:#?}", req);
+                    req
+                }
                 res => {
-                    error!(logger, "failed to receive first heartbeat: {:?}", res);
+                    debug!(logger, "failed to receive first heartbeat: {:?}", res);
                     let _ = sink
                         .fail(RpcStatus::with_message(
                             RpcStatusCode::UNKNOWN,
@@ -450,6 +490,8 @@ impl Pd for PdService {
                 }
             };
             let id = cluster.id();
+            debug!(logger, "pd region_heartbeat, req:{:#?}", req);
+            // first check cluster
             if let Some((et, msg)) = check_id(id, req.get_header()) {
                 let mut resp = RegionHeartbeatResponse::default();
                 resp.mut_header().set_cluster_id(id);
@@ -458,11 +500,11 @@ impl Pd for PdService {
                 let _ = sink.close().await;
                 return;
             }
-
             let (mut batch_tx, batch_rx) = mpsc::channel(1024);
             let (sched_tx, sched_rx) = mpsc::channel::<RegionHeartbeatResponse>(1024);
             let store_id = req.get_leader().get_store_id();
             batch_tx.try_send(req).unwrap();
+            //stream as batch_tx
             let collect = async move {
                 let mut wrap_stream = stream.map_err(Error::Rpc);
                 let mut wrap_tx =
@@ -478,8 +520,9 @@ impl Pd for PdService {
             cluster.register_region_stream(&remote, store_id, batch_rx, sched_tx);
             let res = join!(collect, sched);
             if res.0.is_err() || res.1.is_err() {
-                error!(logger, "failed to handle tso: {:?}", res);
+                error!(logger, "pd failed to handle region_heartbeat: {:?}", res);
             }
+            debug!(logger, "pd region_hearbeat, result:{:#?}", res);
         };
         ctx.spawn(f);
     }
@@ -490,6 +533,7 @@ impl Pd for PdService {
         req: GetRegionRequest,
         sink: UnarySink<GetRegionResponse>,
     ) {
+        debug!(self.logger, "pd get_region from:{}, {:#?}", ctx.peer(), req);
         self.get_region_impl(ctx, req, sink, false)
     }
 
@@ -499,6 +543,12 @@ impl Pd for PdService {
         req: GetRegionRequest,
         sink: UnarySink<GetRegionResponse>,
     ) {
+        debug!(
+            self.logger,
+            "pd get_prev_region from:{}, {:#?}",
+            ctx.peer(),
+            req
+        );
         self.get_region_impl(ctx, req, sink, true)
     }
 
@@ -508,6 +558,12 @@ impl Pd for PdService {
         req: GetRegionByIDRequest,
         sink: UnarySink<GetRegionResponse>,
     ) {
+        debug!(
+            self.logger,
+            "pd get_region_by_id from:{}, {:#?}",
+            ctx.peer(),
+            req
+        );
         let resp = check_bootstrap!(ctx, self.cluster, sink, req, GetRegionResponse);
         let r = query::get_region_by_id(&self.db.build(), req.get_region_id());
         self.get_region_by_id_impl(ctx, r, resp, sink)
@@ -519,6 +575,12 @@ impl Pd for PdService {
         req: ScanRegionsRequest,
         sink: UnarySink<ScanRegionsResponse>,
     ) {
+        debug!(
+            self.logger,
+            "pd scan_regions from:{}, {:#?}",
+            ctx.peer(),
+            req
+        );
         let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, ScanRegionsResponse);
         let regions = query::scan_region(&self.db.build(), req.get_start_key(), req.get_end_key());
         if regions.is_empty() {
@@ -553,6 +615,7 @@ impl Pd for PdService {
         req: AskSplitRequest,
         sink: UnarySink<AskSplitResponse>,
     ) {
+        debug!(self.logger, "pd ask_split from:{}, {:#?}", ctx.peer(), req);
         let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, AskSplitResponse);
         let region = req.get_region();
         let count = match self.get_split_id_count(region, 1) {
@@ -591,6 +654,12 @@ impl Pd for PdService {
         mut req: ReportSplitRequest,
         sink: UnarySink<ReportSplitResponse>,
     ) {
+        debug!(
+            self.logger,
+            "pd report_split from:{}, {:#?}",
+            ctx.peer(),
+            req
+        );
         let resp = check_bootstrap!(ctx, self.cluster, sink, req, ReportSplitResponse);
         self.cluster
             .put_regions(vec![req.take_left(), req.take_right()]);
@@ -605,6 +674,12 @@ impl Pd for PdService {
         req: AskBatchSplitRequest,
         sink: UnarySink<AskBatchSplitResponse>,
     ) {
+        debug!(
+            self.logger,
+            "pd ask_batch_split from:{}, {:#?}",
+            ctx.peer(),
+            req
+        );
         let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, AskBatchSplitResponse);
         let region = req.get_region();
         let split_count = req.get_split_count() as u64;
@@ -650,6 +725,12 @@ impl Pd for PdService {
         mut req: ReportBatchSplitRequest,
         sink: UnarySink<ReportBatchSplitResponse>,
     ) {
+        debug!(
+            self.logger,
+            "pd report_batch_split from:{}, {:#?}",
+            ctx.peer(),
+            req
+        );
         let resp = check_bootstrap!(ctx, self.cluster, sink, req, ReportBatchSplitResponse);
         self.cluster.put_regions(req.take_regions().into());
         ctx.spawn(async move {
@@ -660,91 +741,206 @@ impl Pd for PdService {
     fn get_cluster_config(
         &mut self,
         ctx: RpcContext,
-        _req: GetClusterConfigRequest,
+        req: GetClusterConfigRequest,
         sink: UnarySink<GetClusterConfigResponse>,
     ) {
+        debug!(
+            self.logger,
+            "pd get_cluster_config from:{}, {:#?}",
+            ctx.peer(),
+            req
+        );
         grpcio::unimplemented_call!(ctx, sink)
     }
+
     fn put_cluster_config(
         &mut self,
         ctx: RpcContext,
-        _req: PutClusterConfigRequest,
+        req: PutClusterConfigRequest,
         sink: UnarySink<PutClusterConfigResponse>,
     ) {
+        debug!(
+            self.logger,
+            "put_cluster_config from:{}, {:#?}",
+            ctx.peer(),
+            req
+        );
         grpcio::unimplemented_call!(ctx, sink)
     }
+
     fn scatter_region(
         &mut self,
         ctx: RpcContext,
-        _req: ScatterRegionRequest,
+        req: ScatterRegionRequest,
         sink: UnarySink<ScatterRegionResponse>,
     ) {
+        debug!(
+            self.logger,
+            "pd scatter_region from:{},{:#?}",
+            ctx.peer(),
+            req
+        );
         grpcio::unimplemented_call!(ctx, sink)
     }
+
     fn get_gc_safe_point(
         &mut self,
         ctx: RpcContext,
-        _req: GetGCSafePointRequest,
+        req: GetGCSafePointRequest,
         sink: UnarySink<GetGCSafePointResponse>,
     ) {
-        grpcio::unimplemented_call!(ctx, sink)
+        debug!(
+            self.logger,
+            "pd get_gc_safe_point from:{}, {:#?}",
+            ctx.peer(),
+            req
+        );
+        let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, GetGCSafePointResponse);
+        let safe_point = query::get_gc_safe_point(&self.db.build());
+        if !safe_point.is_err() {
+            resp.set_safe_point(safe_point.unwrap());
+        } else {
+            fill_error(
+                resp.mut_header(),
+                ErrorType::UNKNOWN,
+                "gc safte point not found".to_string(),
+            );
+        }
+        ctx.spawn(async move {
+            let _ = sink.success(resp);
+        });
     }
+
     fn update_gc_safe_point(
         &mut self,
         ctx: RpcContext,
-        _req: UpdateGCSafePointRequest,
+        req: UpdateGCSafePointRequest,
         sink: UnarySink<UpdateGCSafePointResponse>,
     ) {
-        grpcio::unimplemented_call!(ctx, sink)
+        debug!(
+            self.logger,
+            "pd update_gc_safe_point from:{}, {:#?}",
+            ctx.peer(),
+            req
+        );
+        let mut resp = check_bootstrap!(ctx, self.cluster, sink, req, UpdateGCSafePointResponse);
+        let cluster = self.cluster.clone();
+        let safe_point = req.get_safe_point();
+        let logger = self.logger.clone();
+        let f = async move {
+            if let Err(e) = cluster.update_gc_safe_point(safe_point).await {
+                debug!(logger, "cluster update gc safe point fail");
+                fill_error(resp.mut_header(), ErrorType::UNKNOWN, format!("{}", e));
+            }
+            let _ = sink.success(resp).await;
+        };
+        ctx.spawn(f);
     }
+
     fn update_service_gc_safe_point(
         &mut self,
         ctx: RpcContext,
-        _req: UpdateServiceGCSafePointRequest,
+        mut req: UpdateServiceGCSafePointRequest,
         sink: UnarySink<UpdateServiceGCSafePointResponse>,
     ) {
-        grpcio::unimplemented_call!(ctx, sink)
+        debug!(
+            self.logger,
+            "pd update_service_gc_safe_point from:{}, {:#?}",
+            ctx.peer(),
+            req
+        );
+        let mut resp = check_bootstrap!(
+            ctx,
+            self.cluster,
+            sink,
+            req,
+            UpdateServiceGCSafePointResponse
+        );
+        let cluster = self.cluster.clone();
+        let ttl = req.get_TTL();
+        let safe_point = req.get_safe_point();
+        let service_id = req.take_service_id();
+        let logger = self.logger.clone();
+        let f = async move {
+            if let Err(e) = cluster
+                .update_service_gc_safe_point(&service_id, ttl, safe_point)
+                .await
+            {
+                debug!(logger, "cluster update service gc safe point fail");
+                fill_error(resp.mut_header(), ErrorType::UNKNOWN, format!("{}", e));
+            }
+            let _ = sink.success(resp).await;
+        };
+        ctx.spawn(f);
     }
+
     fn sync_regions(
         &mut self,
         ctx: RpcContext,
-        _stream: RequestStream<SyncRegionRequest>,
+        stream: RequestStream<SyncRegionRequest>,
         sink: DuplexSink<SyncRegionResponse>,
     ) {
+        debug!(self.logger, "pd sync_regions from:{}", ctx.peer());
         grpcio::unimplemented_call!(ctx, sink)
     }
+
     fn get_operator(
         &mut self,
         ctx: RpcContext,
-        _req: GetOperatorRequest,
+        req: GetOperatorRequest,
         sink: UnarySink<GetOperatorResponse>,
     ) {
+        debug!(
+            self.logger,
+            "pd get_operator from:{}, {:#?}",
+            ctx.peer(),
+            req
+        );
         grpcio::unimplemented_call!(ctx, sink)
     }
+
     fn sync_max_ts(
         &mut self,
         ctx: RpcContext,
-        _req: SyncMaxTSRequest,
+        req: SyncMaxTSRequest,
         sink: UnarySink<SyncMaxTSResponse>,
     ) {
+        debug!(
+            self.logger,
+            "pd sync_max_ts from:{}, {:#?}",
+            ctx.peer(),
+            req
+        );
         grpcio::unimplemented_call!(ctx, sink)
     }
 
     fn split_regions(
         &mut self,
         ctx: RpcContext,
-        _req: SplitRegionsRequest,
+        req: SplitRegionsRequest,
         sink: UnarySink<SplitRegionsResponse>,
     ) {
+        debug!(
+            self.logger,
+            "ps split_regions from:{}, {:#?}",
+            ctx.peer(),
+            req
+        );
         grpcio::unimplemented_call!(ctx, sink)
     }
 
     fn get_dc_location_info(
         &mut self,
         ctx: RpcContext,
-        _req: GetDCLocationInfoRequest,
+        req: GetDCLocationInfoRequest,
         sink: UnarySink<GetDCLocationInfoResponse>,
     ) {
+        debug!(
+            self.logger,
+            "pd get_dc_location_info from:{}, {:#?}",
+            ctx.peer(),
+            req
+        );
         grpcio::unimplemented_call!(ctx, sink)
     }
 }

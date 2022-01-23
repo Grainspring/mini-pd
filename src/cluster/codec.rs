@@ -4,11 +4,14 @@ use bytes::{BufMut, Bytes, BytesMut};
 
 pub const CLUSTER_ID_KEY: Bytes = Bytes::from_static(b"dcluster");
 pub const CLUSTER_BOOTSTRAP_KEY: Bytes = Bytes::from_static(b"dcluster_bootstrap");
+pub static GC_SAFEPOINT_KEY_PREFIX: &[u8] = b"dgc_safepoint";
+pub static SERVICE_PREFIX: &[u8] = b"_service";
+pub static GCWORKER_SERVICE_SAFEPOINT_ID: &[u8] = b"gc_worker";
 
 static REGION_KEY_PREFIX: &[u8] = b"dr";
 static STORE_KEY_PREFIX: &[u8] = b"ds";
-static RANGE_KEY_PREFIX: &[u8] = b"dt";
-static RANGE_MAX_KEY: &[u8] = b"du";
+static RANGE_KEY_PREFIX: &[u8] = b"du";
+static RANGE_MAX_KEY: &[u8] = b"dt";
 
 fn put_order_byte(buf: &mut BytesMut, bytes: &[u8]) {
     let cap = ((bytes.len() - 1) / 8 + 1) * 9;
@@ -63,5 +66,15 @@ pub fn region_range_key(key: &[u8], version: u64) -> Bytes {
 }
 
 pub fn region_range_value(id: u64) -> Bytes {
-    Bytes::copy_from_slice(&id.to_le_bytes())
+    Bytes::copy_from_slice(&id.to_be_bytes())
+}
+
+pub fn service_safe_point_key(service_id: &[u8]) -> Bytes {
+    let mut buf = BytesMut::with_capacity(service_id.len() + 20);
+    buf.put_slice(GC_SAFEPOINT_KEY_PREFIX);
+    buf.put_slice(SERVICE_PREFIX);
+    if !service_id.is_empty() {
+        buf.put_slice(service_id);
+    }
+    buf.freeze()
 }
